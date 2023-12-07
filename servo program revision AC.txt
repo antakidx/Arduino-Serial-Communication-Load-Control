@@ -1,0 +1,204 @@
+//This program is designed to receive a byte sequence via serial communication from RealTerm. The program utilizes a data buffer for all necessary addresses, as well as a checksum, to verify the command desired. The program also allows for different commands to be input for operating a servo motor, including moving to a specific angle, resetting the position to zero, and continuously moving back and forth.
+
+//Example byte sequence sent via RealTerm to rotate 180 degrees: 0xAA, 0x00, 0x01, 0x01, 0x01, 0xB4, 0x61
+
+//This program also contains a "heartbeat" by utilizing a state machine to control the duration of pulses sent to the built-in LED on board the Arduino Uno.
+
+
+#include <Servo.h>
+#define servoPin 9
+
+Servo servo;
+uint8_t servoPosition = 0;
+
+
+void BuiltinLEDHeartbeatHandler() {
+  static uint8_t state = 0;
+  static unsigned long pTime = 0;
+
+  switch(state) {
+    case 0:
+      if (millis() - pTime >= 950) {
+        pTime = millis();
+        DDRB = (1<<DDB5);
+        PORTB = (1<<PB5);
+        state = 1;
+      }
+        break;
+
+    case 1:
+      if (millis() - pTime >= 50) {
+        pTime = millis();
+        DDRB = (1<<DDB5);
+        PORTB = (0<<PB5);
+        state = 0;
+      }
+        break;
+    }
+}
+
+
+enum State {
+  idle,
+  fromAddress,
+  toAddress,
+  command,
+  payloadLength,
+  payload,
+  checksum
+};
+
+State currentState = idle;
+uint8_t dataBuffer[255];
+uint8_t bufferIndex = 0;
+uint8_t payLength = 0;
+uint8_t checksumCount = 0;
+
+
+void SerialReceiveHandler() {
+  if (Serial.available() > 0) {
+    uint8_t receivedByte = Serial.read();
+    switch (currentState) {
+      case idle:
+        if (receivedByte == 0xAA) {
+          currentState = fromAddress;                       //go to next case
+          bufferIndex = 0;                                  //reset data buffer index
+          checksumCount = 0;                                //checksum is reset to 0
+          checksumCount += 0xAA;                            //add first byte for checksum validation
+        }
+          break;
+        
+      case fromAddress:
+        dataBuffer[bufferIndex++] = receivedByte;
+        if (bufferIndex >= 1) {                             //next data buffer index
+          currentState = toAddress;                         //go to next case
+          checksumCount += receivedByte;                    //add second byte for checksum validation
+        }
+          break;
+        
+      case toAddress:
+        dataBuffer[bufferIndex++] = receivedByte;
+        if (bufferIndex >= 2) {                             //next data buffer index
+          currentState = command;                           //go to next case
+          checksumCount += receivedByte;                    //add third byte for checksum validation
+        }
+          break;
+
+      case command:
+        dataBuffer[bufferIndex++] = receivedByte;
+        if (bufferIndex >= 3) {                             //next data buffer index
+          currentState = payloadLength;                     //go to next case
+          checksumCount += receivedByte;                    //add fourth byte for checksum validation
+        }
+          break;
+
+      case payloadLength:
+        payLength = receivedByte;
+        checksumCount += receivedByte;                      //add fifth byte for checksum validation
+        dataBuffer[bufferIndex++] = receivedByte;
+        if (payLength != 0) {
+          currentState = payload;                           //if the payload length isn't 0 then go to payload case
+        }
+        else {
+          currentState = checksum;                          //otherwise, go to checksum case
+        }
+          break;
+
+      case payload:
+        dataBuffer[bufferIndex++] = receivedByte;
+        checksumCount += receivedByte;                      //add sixth byte for checksum validation
+        if (bufferIndex >= 4 + payLength) {                 //next data buffer index + payload length
+          currentState = checksum;                          //go to next case
+        }
+          break;
+
+      case checksum:
+        if (receivedByte == checksumCount) {
+          SerialPacketParser();                             //if checksum is valid then do SerialPacketParser function
+        }
+        currentState = idle;                                //reset state machine back to first case
+          break;
+    }
+  }
+}
+
+
+bool flagResetServoToZero;                                  //latch for resetting servo position
+bool flagMoveToAngle;                                       //latch for moving servo to specific angle
+bool flagRotateBackAndForth;                                //latch for rotating servo back and forth
+
+
+void SerialPacketParser() {
+  switch (dataBuffer[2]) {
+    case 0:                                                 //case for resetting servo position back to 0
+      flagResetServoToZero = true;
+      flagMoveToAngle = false;
+      flagRotateBackAndForth = false;
+        break;
+    default:
+      if (dataBuffer[4] >= 0 && dataBuffer[4] <= 180) {     //if any value from 0-180 is entered then trigger move to angle flag
+        flagResetServoToZero = false;
+        flagMoveToAngle = true;
+        flagRotateBackAndForth = false;
+      }
+      else {                                                //if any other value is entered i.e. -1 or 181 then trigger rotate back and forth flag
+        flagResetServoToZero = false;
+        flagMoveToAngle = false;
+        flagRotateBackAndForth = true;
+      }
+  }
+}
+
+
+enum ServoState {
+  Idle,
+  ResetToZero,
+  MoveToAngle,
+  RotateBackAndForth
+};
+
+ServoState motorState = Idle;
+
+
+void ServoOperation() {
+  if (flagResetServoToZero) {                               //servo reset to 0 latch is triggered
+    servo.write(0);                                         //write servo to 0
+    servoPosition = 0;                                      //reset servo position variable
+    flagResetServoToZero = false;                           //reset latch variable
+  }
+  if (flagMoveToAngle) {                                    //move servo to specific angle latch is triggered
+    servo.write(dataBuffer[4]);                             //write servo to whatever value from 0-180 is in data buffer
+    flagMoveToAngle = false;                                //reset move to specific angle latch
+  }
+  if (flagRotateBackAndForth) {                             //rotate servo back and forth latch is triggered
+    static int direction = 1;                               //move in positive direction
+    static int currentAngle = 0;                            //motor arm is at 0 degrees
+    currentAngle += direction;                              //angle is incremented positively
+    servo.write(currentAngle);                              //continuously write angle to servo    
+    if (currentAngle <= 0 || currentAngle >= 180) {
+      direction *= -1;                                      //if angle gets less than 0 (when motor is rotating backwards) or if angle gets greater than 180 (when motor is rotating forwards) then change direction
+    }
+  }
+}
+
+
+void setup() {
+  DDRB &= ~(1<<DDB0);
+  PORTB &= ~(1<<PB0);
+  DDRB |= (1<<DDB5);
+  PORTB |= (1<<PD5);
+  Serial.begin(9600);
+  servo.attach(servoPin);
+  servo.write(servoPosition);
+}
+
+
+//cyclical redundancy check is better for detecting rearranged data (for small packets)
+//hashing functions (take a lot more computation so bad for small packets) are good for bigger files
+
+
+void loop() {
+  BuiltinLEDHeartbeatHandler();
+  SerialReceiveHandler();
+  ServoOperation();
+}
